@@ -55,34 +55,35 @@ jobs:
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
           p = Path('upstream/app/src/main/cpp/phantom/PhantomBridge.cpp')
           s = p.read_text(encoding='utf-8')
+
           if '#include <cstring>' not in s:
-              s = s.replace('#include <assert.h>', '#include <assert.h>\n#include <cstring>')
-          old = '''    if (m_buffer_read_position + size > m_buffer_write_position) {
-              if (m_buffer_loaded) {
-                  int until_bounds = m_buffer_write_position - m_buffer_read_position;
-                  overwrite_buffer(buffer, until_bounds);
-                  m_buffer_read_position = 0;
-                  return overwrite_buffer(buffer + until_bounds, size - until_bounds);
-              }
-              return false;
-          }'''
-          new = '''    if (m_buffer_read_position + size > m_buffer_write_position) {
-              if (m_buffer_loaded) {
-                  int until_bounds = m_buffer_write_position - m_buffer_read_position;
-                  overwrite_buffer(buffer, until_bounds);
-                  m_buffer_read_position = 0;
-                  return overwrite_buffer(buffer + until_bounds, size - until_bounds);
-              }
-              // LIVE mode can temporarily run out of PCM. Never fall back to the
-              // physical microphone: return silence until the next live chunk arrives.
-              memset(buffer, 0, size);
-              return true;
-          }'''
-          if old not in s:
-              raise SystemExit('underflow block not found')
-          p.write_text(s.replace(old, new), encoding='utf-8')
+              s = s.replace('#include <assert.h>', '#include <assert.h>\n#include <cstring>', 1)
+
+          start = s.index('bool PhantomBridge::overwrite_buffer')
+          end = s.index('void PhantomBridge::on_load_done', start)
+          segment = s[start:end]
+
+          old = '        return false;'
+          if old not in segment:
+              raise SystemExit('LIVE underflow return false not found')
+
+          segment = segment.replace(
+              old,
+              '        // LIVE underflow: never expose the physical microphone.\n'
+              '        memset(buffer, 0, size);\n'
+              '        return true;',
+              1
+          )
+          s = s[:start] + segment + s[end:]
+          p.write_text(s, encoding='utf-8')
+
+          check = p.read_text(encoding='utf-8')
+          if 'LIVE underflow: never expose the physical microphone.' not in check:
+              raise SystemExit('native patch verification failed')
+          print('Native underflow patch applied')
           PY
 
       - name: Build armeabi-v7a native hook
