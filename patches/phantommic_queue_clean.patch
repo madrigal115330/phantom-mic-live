@@ -1,0 +1,849 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index 272ce9e..f527fc4 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -11,14 +11,14 @@ android {
+         applicationId "tn.amin.phantom_mic"
+         minSdk 24
+         targetSdk 33
+-        versionCode 3
+-        versionName "2.0"
++        versionCode 4
++        versionName "2.1-queue"
+ 
+         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+ 
+         externalNativeBuild {
+             cmake {
+-                abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64', 'x86'
++                abiFilters 'armeabi-v7a'
+                 cppFlags "-std=c++20"
+                 cFlags "-std=gnu99"
+             }
+diff --git a/app/src/main/cpp/main.cpp b/app/src/main/cpp/main.cpp
+index ee53f57..5d6e56e 100644
+--- a/app/src/main/cpp/main.cpp
++++ b/app/src/main/cpp/main.cpp
+@@ -159,4 +159,29 @@ extern "C"
+ JNIEXPORT void JNICALL
+ Java_tn_amin_phantom_1mic_audio_AudioMaster_onLoadDone(JNIEnv *env, jobject thiz) {
+     g_phantomBridge->on_load_done();
+-}
+\ No newline at end of file
++}
++
++extern "C"
++JNIEXPORT void JNICALL
++Java_tn_amin_phantom_1mic_PhantomManager_nativeSetAiMode(JNIEnv *env, jobject thiz, jboolean ai_mode) {
++    if (g_phantomBridge != nullptr) {
++        g_phantomBridge->set_ai_mode(ai_mode == JNI_TRUE);
++    }
++}
++
++extern "C"
++JNIEXPORT jboolean JNICALL
++Java_tn_amin_phantom_1mic_PhantomManager_nativeIsPlaybackFinished(JNIEnv *env, jobject thiz) {
++    if (g_phantomBridge == nullptr) {
++        return JNI_FALSE;
++    }
++    return g_phantomBridge->is_playback_finished() ? JNI_TRUE : JNI_FALSE;
++}
++
++extern "C"
++JNIEXPORT void JNICALL
++Java_tn_amin_phantom_1mic_PhantomManager_nativeResetAudioBuffer(JNIEnv *env, jobject thiz) {
++    if (g_phantomBridge != nullptr) {
++        g_phantomBridge->reset_audio_buffer();
++    }
++}
+diff --git a/app/src/main/cpp/phantom/PhantomBridge.cpp b/app/src/main/cpp/phantom/PhantomBridge.cpp
+index 7d1112e..23d6873 100644
+--- a/app/src/main/cpp/phantom/PhantomBridge.cpp
++++ b/app/src/main/cpp/phantom/PhantomBridge.cpp
+@@ -2,6 +2,8 @@
+ #include <malloc.h>
+ #include <memory>
+ #include <assert.h>
++#include <cstring>
++#include <algorithm>
+ #include "PhantomBridge.h"
+ #include "../logging.h"
+ 
+@@ -28,11 +30,11 @@ int audioFormatToJava(int audioFormat) {
+     }
+ }
+ 
+-
+ void PhantomBridge::update_audio_format(JNIEnv* env, int sampleRate, int audioFormat, int channelMask) {
+     jclass j_phantomManagerClass = env->GetObjectClass(j_phantomManager);
+     jmethodID method = env->GetMethodID(j_phantomManagerClass, "updateAudioFormat", "(III)V");
+     env->CallVoidMethod(j_phantomManager, method, sampleRate, channelMask, audioFormatToJava(audioFormat));
++    env->DeleteLocalRef(j_phantomManagerClass);
+ 
+     mAudioFormat = audioFormat;
+ }
+@@ -41,11 +43,14 @@ void PhantomBridge::load(JNIEnv *env) {
+     jclass j_phantomManagerClass = env->GetObjectClass(j_phantomManager);
+     jmethodID method = env->GetMethodID(j_phantomManagerClass, "load", "()V");
+     env->CallVoidMethod(j_phantomManager, method);
++    env->DeleteLocalRef(j_phantomManagerClass);
+ }
+ 
+ PhantomBridge::PhantomBridge(jobject j_phantomManager) : j_phantomManager(j_phantomManager) {}
+ 
+ void PhantomBridge::on_buffer_chunk_loaded(jbyte *buffer, jsize size) {
++    std::lock_guard<std::mutex> lock(m_buffer_mutex);
++
+     if (m_buffer == nullptr) {
+         m_buffer = (jbyte*) malloc(m_buffer_size);
+     }
+@@ -55,7 +60,6 @@ void PhantomBridge::on_buffer_chunk_loaded(jbyte *buffer, jsize size) {
+         m_buffer = (jbyte*) realloc(m_buffer, m_buffer_size);
+     }
+ 
+-    // PCM_FLOAT
+     if (mAudioFormat == 0x5u) {
+         float* dst_float = reinterpret_cast<float*>(m_buffer);
+         int16_t* src16 = reinterpret_cast<int16_t*>(buffer);
+@@ -65,7 +69,6 @@ void PhantomBridge::on_buffer_chunk_loaded(jbyte *buffer, jsize size) {
+         }
+         m_buffer_write_position += n_samples * sizeof(float);
+     }
+-    // PCM_16_BIT
+     else {
+         if (mAudioFormat != 0x1) {
+             LOGW("Unsupported audio format %d", mAudioFormat);
+@@ -76,38 +79,71 @@ void PhantomBridge::on_buffer_chunk_loaded(jbyte *buffer, jsize size) {
+ }
+ 
+ bool PhantomBridge::overwrite_buffer(char* buffer, int size) {
+-    if (m_buffer_read_position + size > m_buffer_write_position) {
+-        if (m_buffer_loaded) {
+-            int until_bounds = m_buffer_write_position - m_buffer_read_position;
+-            overwrite_buffer(buffer, until_bounds);
+-            m_buffer_read_position = 0;
+-            return overwrite_buffer(buffer + until_bounds, size - until_bounds);
+-        }
++    if (!m_ai_mode.load(std::memory_order_relaxed)) {
+         return false;
+     }
+ 
+-    memcpy(buffer, m_buffer + m_buffer_read_position, size);
+-    m_buffer_read_position += size;
++    std::lock_guard<std::mutex> lock(m_buffer_mutex);
++
++    int available = m_buffer_write_position - m_buffer_read_position;
++    int to_copy = std::max(0, std::min(size, available));
++
++    if (to_copy > 0 && m_buffer != nullptr) {
++        memcpy(buffer, m_buffer + m_buffer_read_position, to_copy);
++        m_buffer_read_position += to_copy;
++    }
++
++    if (to_copy < size) {
++        memset(buffer + to_copy, 0, size - to_copy);
++    }
++
++    if (m_buffer_loaded && m_buffer_read_position >= m_buffer_write_position) {
++        m_playback_finished = true;
++    }
+ 
+     return true;
+ }
+ 
+ void PhantomBridge::on_load_done() {
++    std::lock_guard<std::mutex> lock(m_buffer_mutex);
+     m_buffer_loaded = true;
++    if (m_buffer_write_position == 0) {
++        m_playback_finished = true;
++    }
+ }
+ 
+-void PhantomBridge::unload(JNIEnv *env) {
++void PhantomBridge::set_ai_mode(bool enabled) {
++    m_ai_mode.store(enabled, std::memory_order_relaxed);
++}
++
++bool PhantomBridge::is_playback_finished() {
++    std::lock_guard<std::mutex> lock(m_buffer_mutex);
++    return m_playback_finished;
++}
++
++void PhantomBridge::reset_audio_buffer_locked() {
+     if (m_buffer != nullptr) {
+         free(m_buffer);
+         m_buffer = nullptr;
+-
+-        m_buffer_loaded = false;
+-        m_buffer_size = 16384;
+-        m_buffer_write_position = 0;
+-        m_buffer_read_position = 0;
+-
+-        jclass j_phantomManagerClass = env->GetObjectClass(j_phantomManager);
+-        jmethodID method = env->GetMethodID(j_phantomManagerClass, "unload", "()V");
+-        env->CallVoidMethod(j_phantomManager, method);
+     }
++
++    m_buffer_loaded = false;
++    m_playback_finished = false;
++    m_buffer_size = 16384;
++    m_buffer_write_position = 0;
++    m_buffer_read_position = 0;
++}
++
++void PhantomBridge::reset_audio_buffer() {
++    std::lock_guard<std::mutex> lock(m_buffer_mutex);
++    reset_audio_buffer_locked();
++}
++
++void PhantomBridge::unload(JNIEnv *env) {
++    reset_audio_buffer();
++
++    jclass j_phantomManagerClass = env->GetObjectClass(j_phantomManager);
++    jmethodID method = env->GetMethodID(j_phantomManagerClass, "unload", "()V");
++    env->CallVoidMethod(j_phantomManager, method);
++    env->DeleteLocalRef(j_phantomManagerClass);
+ }
+diff --git a/app/src/main/cpp/phantom/PhantomBridge.h b/app/src/main/cpp/phantom/PhantomBridge.h
+index e8ae605..9046912 100644
+--- a/app/src/main/cpp/phantom/PhantomBridge.h
++++ b/app/src/main/cpp/phantom/PhantomBridge.h
+@@ -6,33 +6,39 @@
+ #define PHANTOMMIC_PHANTOMBRIDGE_H
+ 
+ #include <jni.h>
++#include <mutex>
++#include <atomic>
+ 
+ class PhantomBridge {
+ public:
+     PhantomBridge(jobject j_phantomManager);
+ 
+     void update_audio_format(JNIEnv* env, int sampleRate, int audioFormat, int channelMask);
+-
+     void load(JNIEnv* env);
+-
+     void on_buffer_chunk_loaded(jbyte* buffer, jsize size);
+-
+     bool overwrite_buffer(char* buffer, int size);
+-
+     void on_load_done();
+-
+     void unload(JNIEnv *env);
+ 
++    void set_ai_mode(bool enabled);
++    bool is_playback_finished();
++    void reset_audio_buffer();
++
+ private:
++    void reset_audio_buffer_locked();
++
+     jobject j_phantomManager;
+ 
+     bool m_buffer_loaded = false;
++    bool m_playback_finished = false;
+     int m_buffer_size = 16384;
+     int m_buffer_write_position = 0;
+     int m_buffer_read_position = 0;
+     jbyte* m_buffer = nullptr;
+ 
+     int mAudioFormat = 0x1;
++    std::mutex m_buffer_mutex;
++    std::atomic<bool> m_ai_mode{true};
+ };
+ 
+ #endif //PHANTOMMIC_PHANTOMBRIDGE_H
+diff --git a/app/src/main/java/tn/amin/phantom_mic/PhantomManager.java b/app/src/main/java/tn/amin/phantom_mic/PhantomManager.java
+index f5c2e72..d289f42 100644
+--- a/app/src/main/java/tn/amin/phantom_mic/PhantomManager.java
++++ b/app/src/main/java/tn/amin/phantom_mic/PhantomManager.java
+@@ -7,17 +7,16 @@ import android.net.Uri;
+ import android.os.Build;
+ import android.os.Environment;
+-import android.os.ParcelFileDescriptor;
+ import android.provider.DocumentsContract;
+ import android.widget.Toast;
+ 
+-import androidx.documentfile.provider.DocumentFile;
+-
+ import java.io.File;
+ import java.io.FileDescriptor;
+-import java.io.FileInputStream;
++import java.io.FileWriter;
+ import java.io.IOException;
+ import java.lang.ref.WeakReference;
++import java.util.Arrays;
++import java.util.Comparator;
+ 
+ import tn.amin.phantom_mic.audio.AudioMaster;
+ import tn.amin.phantom_mic.hook.ActivityResultWrapper;
+@@ -25,27 +24,30 @@ import tn.amin.phantom_mic.log.Logger;
+ 
+ public class PhantomManager {
+     private static final String DEFAULT_RECORDINGS_PATH = "Recordings";
+-
+-    private static final String KEY_INTENT_FILE = "tn.amin.phantom_mic.AUDIO_FILE";
+-
+-    private static final String FILE_CONFIG = "phantom.txt";
+-
++    private static final String QUEUE_PREFIX = "pmq_";
++    private static final String QUEUE_EXTENSION = ".wav";
++    private static final String MODE_FILE = "phantom_mode.txt";
++    private static final String STATUS_FILE = "phantom_status.txt";
++    private static final String ERROR_FILE = "phantom_errors.log";
+     private static final int REQUEST_CODE = 2608;
+ 
+     private Uri mUriPath;
+-
+     private final WeakReference<Context> mContext;
+-
+     private final AudioMaster mAudioMaster;
+     private final SPManager mSPManager;
+     private final FileManager mFileManager;
+     private boolean mNeedPrepare = true;
+ 
++    private final Object mQueueLock = new Object();
++    private volatile boolean mQueueRunning = false;
++    private Thread mQueueThread;
++    private File mCurrentFile;
++    private String mLastStatus = "";
++
+     public PhantomManager(Context context, boolean isNativeHook) {
+         Logger.d("Init phantom manager");
+ 
+         mContext = new WeakReference<>(context);
+-
+         mAudioMaster = new AudioMaster();
+         mSPManager = new SPManager(context);
+         mFileManager = new FileManager(context);
+@@ -56,10 +58,6 @@ public class PhantomManager {
+     }
+ 
+     public void interceptIntent(Intent intent) {
+-//        if (intent.getExtras() != null && intent.getExtras().containsKey(KEY_INTENT_FILE)) {
+-//            mFileName = intent.getExtras().getString(KEY_INTENT_FILE);
+-//            intent.getExtras().remove(KEY_INTENT_FILE);
+-//        }
+     }
+ 
+     public void forceUriPath() {
+@@ -85,10 +83,8 @@ public class PhantomManager {
+                 if (resultCode == Activity.RESULT_OK) {
+                     if (resultData != null && resultData.getData() != null) {
+                         Uri uri = resultData.getData();
+-                        // Perform operations on the document using its URI.
+                         final int takeFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                 | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+-                        // Check for the freshest data.
+                         getContentResolver().takePersistableUriPermission(uri, takeFlags);
+ 
+                         mSPManager.setUriPath(uri);
+@@ -115,37 +111,241 @@ public class PhantomManager {
+         Logger.d("Target: " + sampleRate + "Hz, encoding " + encoding + ", channel count " + mAudioMaster.getFormat().getChannelCount());
+     }
+ 
++    /**
++     * Called by the native AudioRecord::set hook. The original hook remains installed for the
++     * whole call. This only starts the queue controller once.
++     */
+     public void load() {
+         ensureHasUriPath();
++        startQueueWorker();
++    }
++
++    private void startQueueWorker() {
++        synchronized (mQueueLock) {
++            if (mQueueRunning) {
++                return;
++            }
++
++            mQueueRunning = true;
++            mQueueThread = new Thread(this::queueLoop, "PhantomMicQueue");
++            mQueueThread.setDaemon(true);
++            mQueueThread.start();
++        }
++    }
++
++    private void queueLoop() {
++        writeStatus("STARTING");
++
++        while (mQueueRunning) {
++            try {
++                boolean aiMode = readAiMode();
++                nativeSetAiMode(aiMode);
++
++                if (!aiMode) {
++                    writeStatus("HUMAN");
++                    sleepQuietly(75);
++                    continue;
++                }
++
++                if (mCurrentFile != null) {
++                    if (mAudioMaster.isLastLoadFailed()) {
++                        File failed = mCurrentFile;
++                        mCurrentFile = null;
++                        nativeResetAudioBuffer();
++                        markFailed(failed, "decoder failed");
++                        continue;
++                    }
++
++                    if (nativeIsPlaybackFinished()) {
++                        File finished = mCurrentFile;
++                        mCurrentFile = null;
++                        nativeResetAudioBuffer();
++
++                        if (!finished.delete()) {
++                            appendError("Could not delete finished file: " + finished.getAbsolutePath());
++                        }
++                        else {
++                            Logger.d("Deleted played queue file " + finished.getName());
++                        }
++                        continue;
++                    }
++
++                    writeStatus("AI PLAYING " + mCurrentFile.getName());
++                    sleepQuietly(35);
++                    continue;
++                }
++
++                if (mAudioMaster.isLoading()) {
++                    sleepQuietly(35);
++                    continue;
++                }
++
++                File next = findNextQueueFile();
++                if (next == null) {
++                    writeStatus("AI WAITING");
++                    sleepQuietly(60);
++                    continue;
++                }
++
++                nativeResetAudioBuffer();
++                mCurrentFile = next;
++                writeStatus("AI LOADING " + next.getName());
++
++                String baseName = stripExtension(next.getName());
++                FileDescriptor fd = mFileManager.openAudioWithName(mUriPath, baseName);
++                if (fd == null) {
++                    File failed = mCurrentFile;
++                    mCurrentFile = null;
++                    markFailed(failed, "could not open audio file");
++                    continue;
++                }
++
++                mAudioMaster.load(fd);
++            } catch (Throwable t) {
++                appendError("Queue worker error: " + t.getClass().getName() + ": " + String.valueOf(t.getMessage()));
++                Logger.d("Queue worker error: " + t);
++                sleepQuietly(100);
++            }
++        }
++
++        nativeSetAiMode(false);
++        writeStatus("STOPPED");
++    }
++
++    private File findNextQueueFile() {
++        File dir = getQueueDirectory();
++        if (dir == null || !dir.isDirectory()) {
++            return null;
++        }
++
++        File[] files = dir.listFiles((d, name) -> name != null
++                && name.startsWith(QUEUE_PREFIX)
++                && name.endsWith(QUEUE_EXTENSION));
+ 
+-        String fileName = mFileManager.readLine(mUriPath, FILE_CONFIG);
+-        if (fileName == null || fileName.trim().isEmpty()) {
+-            Logger.d("No audio file specified");
++        if (files == null || files.length == 0) {
++            return null;
++        }
++
++        Arrays.sort(files, Comparator.comparing(File::getName));
++        return files[0];
++    }
++
++    private boolean readAiMode() {
++        File dir = getQueueDirectory();
++        if (dir == null) {
++            return true;
++        }
++
++        File mode = new File(dir, MODE_FILE);
++        if (!mode.isFile()) {
++            return true;
++        }
++
++        String line = mFileManager.readLine(mUriPath, MODE_FILE);
++        if (line == null) {
++            return true;
++        }
++
++        return !"HUMAN".equalsIgnoreCase(line.trim());
++    }
++
++    private void markFailed(File failed, String reason) {
++        if (failed == null) {
+             return;
+         }
+ 
+-        FileDescriptor fd = mFileManager.openAudioWithName(mUriPath, fileName.trim());
++        appendError(reason + ": " + failed.getAbsolutePath());
++        File renamed = new File(failed.getParentFile(), failed.getName() + ".error");
++        if (!failed.renameTo(renamed)) {
++            appendError("Could not rename failed queue file: " + failed.getAbsolutePath());
++        }
++        writeStatus("ERROR " + failed.getName());
++        sleepQuietly(100);
++    }
+ 
+-        if (fd == null) {
+-            Toast.makeText(mContext.get(), "Could not open file", Toast.LENGTH_SHORT).show();
++    private File getQueueDirectory() {
++        if (mUriPath == null || mUriPath.getPath() == null) {
++            return null;
++        }
++        if (!"file".equals(mUriPath.getScheme())) {
++            return null;
++        }
++        return new File(mUriPath.getPath());
++    }
++
++    private void writeStatus(String status) {
++        if (status.equals(mLastStatus)) {
+             return;
+         }
++        mLastStatus = status;
++        Logger.d("Status: " + status);
+ 
+-        mAudioMaster.load(fd);
++        File dir = getQueueDirectory();
++        if (dir == null) {
++            return;
++        }
++
++        try (FileWriter writer = new FileWriter(new File(dir, STATUS_FILE), false)) {
++            writer.write(status);
++            writer.write('\n');
++        } catch (IOException e) {
++            Logger.d("Status write failed: " + e.getMessage());
++        }
++    }
++
++    private void appendError(String message) {
++        Logger.d(message);
++
++        File dir = getQueueDirectory();
++        if (dir == null) {
++            return;
++        }
++
++        try (FileWriter writer = new FileWriter(new File(dir, ERROR_FILE), true)) {
++            writer.write(String.valueOf(System.currentTimeMillis()));
++            writer.write(" ");
++            writer.write(message);
++            writer.write('\n');
++        } catch (IOException e) {
++            Logger.d("Error log write failed: " + e.getMessage());
++        }
++    }
+ 
+-        Logger.d("Audio file loaded");
++    private static String stripExtension(String fileName) {
++        int dot = fileName.lastIndexOf('.');
++        return dot > 0 ? fileName.substring(0, dot) : fileName;
++    }
++
++    private static void sleepQuietly(long millis) {
++        try {
++            Thread.sleep(millis);
++        } catch (InterruptedException ignored) {
++            Thread.currentThread().interrupt();
++        }
+     }
+ 
+     private void ensureHasUriPath() {
+         if (mUriPath == null) {
+-            mUriPath = Uri.fromFile(new File(mContext.get().getExternalFilesDir(null), DEFAULT_RECORDINGS_PATH));
+-            Toast.makeText(mContext.get(), "[E] Defaulting to " + mUriPath.getPath(), Toast.LENGTH_SHORT).show();
++            Context context = mContext.get();
++            if (context != null && context.getExternalFilesDir(null) != null) {
++                mUriPath = Uri.fromFile(new File(context.getExternalFilesDir(null), DEFAULT_RECORDINGS_PATH));
++            }
+         }
+     }
+ 
+     public void unload() {
++        synchronized (mQueueLock) {
++            mQueueRunning = false;
++            if (mQueueThread != null) {
++                mQueueThread.interrupt();
++                mQueueThread = null;
++            }
++        }
++
+         mAudioMaster.unload();
+         mFileManager.close();
++        mCurrentFile = null;
++        nativeSetAiMode(false);
+         Logger.d("Done unloading data");
+     }
+ 
+@@ -158,4 +358,7 @@ public class PhantomManager {
+     }
+ 
+     private native void nativeHook();
++    private native void nativeSetAiMode(boolean aiMode);
++    private native boolean nativeIsPlaybackFinished();
++    private native void nativeResetAudioBuffer();
+ }
+diff --git a/app/src/main/java/tn/amin/phantom_mic/audio/AudioMaster.java b/app/src/main/java/tn/amin/phantom_mic/audio/AudioMaster.java
+index 7b8b1d4..ce78ba7 100644
+--- a/app/src/main/java/tn/amin/phantom_mic/audio/AudioMaster.java
++++ b/app/src/main/java/tn/amin/phantom_mic/audio/AudioMaster.java
+@@ -10,7 +10,6 @@ import java.io.FileDescriptor;
+ import java.io.IOException;
+ import java.nio.ByteBuffer;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+-import java.util.concurrent.TimeUnit;
+ 
+ import io.github.nailik.androidresampler.Resampler;
+ import io.github.nailik.androidresampler.ResamplerConfiguration;
+@@ -22,7 +21,8 @@ public class AudioMaster {
+     private static final int TIMEOUT_MS = 1000;
+ 
+     private AudioFormat mOutFormat;
+-    private boolean mIsLoading = false;
++    private volatile boolean mIsLoading = false;
++    private volatile boolean mLastLoadFailed = false;
+ 
+     private final ExecutorService audioLoadExecutor = Executors.newSingleThreadExecutor();
+ 
+@@ -33,6 +33,7 @@ public class AudioMaster {
+         }
+ 
+         mIsLoading = true;
++        mLastLoadFailed = false;
+ 
+         MediaExtractor extractor = new MediaExtractor();
+ 
+@@ -44,6 +45,9 @@ public class AudioMaster {
+             String mimeType = format.getString(MediaFormat.KEY_MIME);
+             if (mimeType == null) {
+                 Logger.d("mimeType cannot be null");
++                mLastLoadFailed = true;
++                mIsLoading = false;
++                extractor.release();
+                 return;
+             }
+ 
+@@ -52,75 +56,99 @@ public class AudioMaster {
+             codec.start();
+ 
+             audioLoadExecutor.execute(() -> loadData(codec, format, extractor));
+-        } catch (IOException e) {
+-            throw new RuntimeException(e);
++        } catch (Throwable e) {
++            mLastLoadFailed = true;
++            mIsLoading = false;
++            try {
++                extractor.release();
++            } catch (Throwable ignored) {
++            }
++            Logger.d("Audio load failed: " + e.getClass().getName() + ": " + String.valueOf(e.getMessage()));
+         }
+     }
+ 
+     public void unload() {
+         mIsLoading = false;
+-        try {
+-            //noinspection ResultOfMethodCallIgnored
+-            audioLoadExecutor.awaitTermination(500, TimeUnit.MILLISECONDS);
+-        } catch (InterruptedException ignored) {
+-        }
++    }
++
++    public boolean isLoading() {
++        return mIsLoading;
++    }
++
++    public boolean isLastLoadFailed() {
++        return mLastLoadFailed;
+     }
+ 
+     private void loadData(MediaCodec codec, MediaFormat format, MediaExtractor extractor) {
+         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
++        boolean completed = false;
+ 
+-        boolean isEOS = false;
+-        do {
+-            if (!isEOS) {
+-                int inputBufferIndex = codec.dequeueInputBuffer(TIMEOUT_MS);
+-                if (inputBufferIndex >= 0) {
+-                    ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferIndex);
+-                    if (inputBuffer != null) {
+-                        int sampleSize = extractor.readSampleData(inputBuffer, 0);
+-                        if (sampleSize < 0) {
+-                            codec.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+-                            isEOS = true;
+-                        } else {
+-                            long presentationTimeUs = extractor.getSampleTime();
+-                            codec.queueInputBuffer(inputBufferIndex, 0, sampleSize, presentationTimeUs, 0);
+-                            extractor.advance();
++        try {
++            boolean isEOS = false;
++            do {
++                if (!isEOS) {
++                    int inputBufferIndex = codec.dequeueInputBuffer(TIMEOUT_MS);
++                    if (inputBufferIndex >= 0) {
++                        ByteBuffer inputBuffer = codec.getInputBuffer(inputBufferIndex);
++                        if (inputBuffer != null) {
++                            int sampleSize = extractor.readSampleData(inputBuffer, 0);
++                            if (sampleSize < 0) {
++                                codec.queueInputBuffer(inputBufferIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
++                                isEOS = true;
++                            } else {
++                                long presentationTimeUs = extractor.getSampleTime();
++                                codec.queueInputBuffer(inputBufferIndex, 0, sampleSize, presentationTimeUs, 0);
++                                extractor.advance();
++                            }
+                         }
+                     }
+                 }
+-            }
+ 
+-            int outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_MS);
+-            if (outputBufferIndex >= 0) {
+-                ByteBuffer outputBuffer = codec.getOutputBuffer(outputBufferIndex);
+-                if (outputBuffer != null) {
+-                    byte[] pcmData = new byte[bufferInfo.size];
+-                    outputBuffer.get(pcmData);
+-                    outputBuffer.clear();
++                int outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, TIMEOUT_MS);
++                if (outputBufferIndex >= 0) {
++                    ByteBuffer outputBuffer = codec.getOutputBuffer(outputBufferIndex);
++                    if (outputBuffer != null) {
++                        byte[] pcmData = new byte[bufferInfo.size];
++                        outputBuffer.get(pcmData);
++                        outputBuffer.clear();
++                        processInBuffer(format, pcmData);
++                    }
++                    codec.releaseOutputBuffer(outputBufferIndex, false);
++                } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
++                    format = codec.getOutputFormat();
++                    Logger.d("Format changed to " + format);
++                }
+ 
+-                    // Resample and store PCM data
+-                    processInBuffer(format, pcmData);
++                if (!mIsLoading) {
++                    Logger.d("Loading aborted");
++                    return;
+                 }
+-                codec.releaseOutputBuffer(outputBufferIndex, false);
+-            } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+-                format = codec.getOutputFormat();
+-                Logger.d("Format changed to " + format);
+-                // Handle format change if necessary
+-            }
++            } while ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0);
+ 
+-            if (!mIsLoading) {
+-                Logger.d("Loading aborted");
+-                break;
++            completed = true;
++        } catch (Throwable e) {
++            mLastLoadFailed = true;
++            Logger.d("Audio decode failed: " + e.getClass().getName() + ": " + String.valueOf(e.getMessage()));
++        } finally {
++            try {
++                codec.stop();
++            } catch (Throwable ignored) {
++            }
++            try {
++                codec.release();
++            } catch (Throwable ignored) {
++            }
++            try {
++                extractor.release();
++            } catch (Throwable ignored) {
+             }
+-        } while ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0);
+-
+-        codec.stop();
+-        codec.release();
+-        extractor.release();
+-        mOutFormat = null;
+ 
+-        Logger.d("Loading done");
+-        mIsLoading = false;
+-        onLoadDone();
++            mIsLoading = false;
++            if (completed && !mLastLoadFailed) {
++                Logger.d("Loading done");
++                onLoadDone();
++            }
++        }
+     }
+ 
+     private void processInBuffer(MediaFormat source, byte[] bufferChunk) {
+@@ -128,6 +156,11 @@ public class AudioMaster {
+             return;
+         }
+ 
++        AudioFormat outFormat = mOutFormat;
++        if (outFormat == null) {
++            throw new IllegalStateException("Target audio format is not ready");
++        }
++
+         ResamplerChannel inChannel;
+         ResamplerChannel outChannel;
+ 
+@@ -136,24 +169,16 @@ public class AudioMaster {
+         else
+             inChannel = ResamplerChannel.STEREO;
+ 
+-        if (mOutFormat.getChannelCount() == 1)
++        if (outFormat.getChannelCount() == 1)
+             outChannel = ResamplerChannel.MONO;
+         else
+             outChannel = ResamplerChannel.STEREO;
+ 
+         ResamplerConfiguration configuration = new ResamplerConfiguration(ResamplerQuality.BEST, inChannel,
+-                source.getInteger(MediaFormat.KEY_SAMPLE_RATE), outChannel, mOutFormat.getSampleRate());
+-//        if (mBuffer.size()) {
+-//            Logger.d(configuration.toString());
+-//        }
++                source.getInteger(MediaFormat.KEY_SAMPLE_RATE), outChannel, outFormat.getSampleRate());
+ 
+         Resampler resampler = new Resampler(configuration);
+         byte[] resampledChunk = resampler.resample(bufferChunk);
+-
+-//        if (mBuffer.size() == 0) {
+-//            Logger.d("Resampling done for first chunk (" + resampledChunk.length + ")");
+-//        }
+-
+         onBufferChunkLoaded(resampledChunk);
+     }
+ 
+@@ -175,6 +200,5 @@ public class AudioMaster {
+     }
+ 
+     public native void onBufferChunkLoaded(byte[] bufferChunk);
+-
+     public native void onLoadDone();
+ }
+diff --git a/settings.gradle b/settings.gradle
+index 12bdcba..4df164c 100644
+--- a/settings.gradle
++++ b/settings.gradle
+@@ -11,6 +11,7 @@ dependencyResolutionManagement {
+         google()
+         mavenCentral()
+         jcenter();
++        maven { url "https://api.xposed.info/" }
+     }
+ }
+ rootProject.name = "PhantomMic"
