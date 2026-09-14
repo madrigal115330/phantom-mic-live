@@ -1,36 +1,215 @@
-# This is a basic workflow to help you get started with Actions
+name: Build PhantomMic Live
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout holder repo
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        shell: bash
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            'platforms;android-33' \
+            'build-tools;33.0.2' \
+            'ndk;25.2.9519653' \
+            'cmake;3.22.1'
+
+      - name: Clone upstream PhantomMic
+        shell: bash
+        run: |
+          git clone https://github.com/Mino260806/PhantomMic.git upstream
+          cd upstream
+          git checkout 768cb32db3eab234083bdc35ad40f9bed833fcc8
+
+      - name: Apply LIVE PCM patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('upstream')
+          java_dir = root / 'app/src/main/java/tn/amin/phantom_mic'
+          audio_dir = java_dir / 'audio'
+
+          live_client = r'''package tn.amin.phantom_mic.audio;
+
+          import java.io.DataInputStream;
+          import java.io.EOFException;
+          import java.net.InetSocketAddress;
+          import java.net.Socket;
+
+          import tn.amin.phantom_mic.log.Logger;
+
+          public class LivePcmClient {
+              private static final String HOST = "127.0.0.1";
+              private static final int PORT = 28661;
+              private static final int MAGIC = 0x42345043;
+              private static final int MAX_PACKET = 1024 * 1024;
+
+              private final AudioMaster audioMaster;
+              private volatile boolean running;
+              private Thread worker;
+              private Socket socket;
+
+              public LivePcmClient(AudioMaster audioMaster) {
+                  this.audioMaster = audioMaster;
+              }
+
+              public synchronized void start() {
+                  if (running) return;
+                  running = true;
+                  worker = new Thread(this::runLoop, "PhantomMic-LivePcm");
+                  worker.setDaemon(true);
+                  worker.start();
+              }
+
+              public synchronized void stop() {
+                  running = false;
+                  closeSocket();
+                  if (worker != null) {
+                      worker.interrupt();
+                      worker = null;
+                  }
+              }
+
+              private void runLoop() {
+                  while (running) {
+                      DataInputStream in = null;
+                      try {
+                          Socket s = new Socket();
+                          s.setTcpNoDelay(true);
+                          s.connect(new InetSocketAddress(HOST, PORT), 700);
+                          socket = s;
+                          in = new DataInputStream(s.getInputStream());
+                          Logger.d("Live PCM connected to B4APawCall");
+
+                          while (running) {
+                              int magic;
+                              try {
+                                  magic = in.readInt();
+                              } catch (EOFException eof) {
+                                  break;
+                              }
+                              if (magic != MAGIC) {
+                                  throw new IllegalStateException("Bad live PCM magic: " + Integer.toHexString(magic));
+                              }
+                              int sampleRate = in.readInt();
+                              int audioFormat = in.readInt();
+                              int channelCount = in.readInt();
+                              int length = in.readInt();
+                              if (length < 0 || length > MAX_PACKET) {
+                                  throw new IllegalStateException("Bad live PCM packet length: " + length);
+                              }
+                              if (length == 0) continue;
+                              byte[] pcm = new byte[length];
+                              in.readFully(pcm);
+                              audioMaster.pushPcm(sampleRate, audioFormat, channelCount, pcm);
+                          }
+                      } catch (Throwable t) {
+                          if (running) Logger.d("Live PCM waiting/reconnecting: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                      } finally {
+                          try { if (in != null) in.close(); } catch (Throwable ignored) {}
+                          closeSocket();
+                      }
+                      if (running) {
+                          try { Thread.sleep(180); } catch (InterruptedException ignored) {}
+                      }
+                  }
+                  Logger.d("Live PCM client stopped");
+              }
+
+              private synchronized void closeSocket() {
+                  if (socket != null) {
+                      try { socket.close(); } catch (Throwable ignored) {}
+                      socket = null;
+                  }
+              }
+          }
+          '''
+          (audio_dir / 'LivePcmClient.java').write_text(live_client, encoding='utf-8')
+
+          audio = audio_dir / 'AudioMaster.java'
+          s = audio.read_text(encoding='utf-8')
+          marker = '    public native void onBufferChunkLoaded(byte[] bufferChunk);'
+          insert = r'''
+              public void pushPcm(int sampleRate, int audioFormat, int channelCount, byte[] pcmData) {
+                  if (pcmData == null || pcmData.length == 0) return;
+                  if (mOutFormat == null) {
+                      Logger.d("LIVE PCM dropped: output format not ready");
+                      return;
+                  }
+                  MediaFormat source = new MediaFormat();
+                  source.setInteger(MediaFormat.KEY_SAMPLE_RATE, sampleRate);
+                  source.setInteger(MediaFormat.KEY_CHANNEL_COUNT, Math.max(1, channelCount));
+                  processInBuffer(source, pcmData);
+              }
+
+          '''
+          if marker not in s:
+              raise SystemExit('AudioMaster marker not found')
+          s = s.replace(marker, insert + marker)
+          audio.write_text(s, encoding='utf-8')
+
+          manager = java_dir / 'PhantomManager.java'
+          s = manager.read_text(encoding='utf-8')
+          if 'import tn.amin.phantom_mic.audio.LivePcmClient;' not in s:
+              s = s.replace('import tn.amin.phantom_mic.audio.AudioMaster;',
+                            'import tn.amin.phantom_mic.audio.AudioMaster;\nimport tn.amin.phantom_mic.audio.LivePcmClient;')
+          field_marker = '    private final AudioMaster mAudioMaster;'
+          s = s.replace(field_marker, field_marker + '\n    private LivePcmClient mLivePcmClient;')
+
+          old_load = '''    public void load() {\n        ensureHasUriPath();\n\n        String fileName = mFileManager.readLine(mUriPath, FILE_CONFIG);\n        if (fileName == null || fileName.trim().isEmpty()) {\n            Logger.d("No audio file specified");\n            return;\n        }\n\n        FileDescriptor fd = mFileManager.openAudioWithName(mUriPath, fileName.trim());\n\n        if (fd == null) {\n            Toast.makeText(mContext.get(), "Could not open file", Toast.LENGTH_SHORT).show();\n            return;\n        }\n\n        mAudioMaster.load(fd);\n\n        Logger.d("Audio file loaded");\n    }'''
+          new_load = '''    public void load() {\n        ensureHasUriPath();\n\n        String fileName = mFileManager.readLine(mUriPath, FILE_CONFIG);\n        if (fileName == null || fileName.trim().isEmpty()) {\n            Logger.d("No audio file specified");\n            return;\n        }\n\n        if ("LIVE".equalsIgnoreCase(fileName.trim())) {\n            if (mLivePcmClient != null) mLivePcmClient.stop();\n            mLivePcmClient = new LivePcmClient(mAudioMaster);\n            mLivePcmClient.start();\n            Logger.d("PhantomMic LIVE mode started");\n            return;\n        }\n\n        FileDescriptor fd = mFileManager.openAudioWithName(mUriPath, fileName.trim());\n        if (fd == null) {\n            Logger.d("Could not open audio file: " + fileName.trim());\n            return;\n        }\n        mAudioMaster.load(fd);\n        Logger.d("Audio file loaded");\n    }'''
+          if old_load not in s:
+              raise SystemExit('PhantomManager load() block not found')
+          s = s.replace(old_load, new_load)
+
+          old_unload = '''    public void unload() {\n        mAudioMaster.unload();\n        mFileManager.close();\n        Logger.d("Done unloading data");\n    }'''
+          new_unload = '''    public void unload() {\n        if (mLivePcmClient != null) {\n            mLivePcmClient.stop();\n            mLivePcmClient = null;\n        }\n        mAudioMaster.unload();\n        mFileManager.close();\n        Logger.d("Done unloading data");\n    }'''
+          if old_unload not in s:
+              raise SystemExit('PhantomManager unload() block not found')
+          s = s.replace(old_unload, new_unload)
+          old_toast = '            Toast.makeText(mContext.get(), "[E] Defaulting to " + mUriPath.getPath(), Toast.LENGTH_SHORT).show();'
+          if old_toast in s:
+              s = s.replace(old_toast, '            Logger.d("Defaulting to " + mUriPath.getPath());')
+          manager.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Build signed debug APK
+        shell: bash
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK signature
+        shell: bash
+        run: |
+          APK='upstream/app/build/outputs/apk/debug/app-debug.apk'
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -1)"
+          "$APKSIGNER" verify --verbose --print-certs "$APK"
+          cp "$APK" PhantomMic-Live-debug-signed.apk
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhantomMic-Live-signed-apk
+          path: PhantomMic-Live-debug-signed.apk
+          if-no-files-found: error
