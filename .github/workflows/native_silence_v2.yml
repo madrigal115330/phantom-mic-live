@@ -1,0 +1,141 @@
+name: Build PhantomMic Live v2 Native
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/native_silence_v2.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout holder repo
+        uses: actions/checkout@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install native build tools
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'build-tools;33.0.2' 'ndk;25.2.9519653' 'cmake;3.22.1'
+
+      - name: Download previous working LIVE APK
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/10331290184/zip" \
+            -o base-artifact.zip
+          mkdir -p base-artifact
+          unzip -q base-artifact.zip -d base-artifact
+          BASE_APK="$(find base-artifact -type f -name '*.apk' | head -1)"
+          test -n "$BASE_APK"
+          cp "$BASE_APK" PhantomMic-Live-v2-base.apk
+
+      - name: Clone upstream native source
+        shell: bash
+        run: |
+          git clone https://github.com/Mino260806/PhantomMic.git upstream
+          cd upstream
+          git checkout 768cb32db3eab234083bdc35ad40f9bed833fcc8
+
+      - name: Patch native underflow behavior
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('upstream/app/src/main/cpp/phantom/PhantomBridge.cpp')
+          s = p.read_text(encoding='utf-8')
+          if '#include <cstring>' not in s:
+              s = s.replace('#include <assert.h>', '#include <assert.h>\n#include <cstring>')
+          old = '''    if (m_buffer_read_position + size > m_buffer_write_position) {
+              if (m_buffer_loaded) {
+                  int until_bounds = m_buffer_write_position - m_buffer_read_position;
+                  overwrite_buffer(buffer, until_bounds);
+                  m_buffer_read_position = 0;
+                  return overwrite_buffer(buffer + until_bounds, size - until_bounds);
+              }
+              return false;
+          }'''
+          new = '''    if (m_buffer_read_position + size > m_buffer_write_position) {
+              if (m_buffer_loaded) {
+                  int until_bounds = m_buffer_write_position - m_buffer_read_position;
+                  overwrite_buffer(buffer, until_bounds);
+                  m_buffer_read_position = 0;
+                  return overwrite_buffer(buffer + until_bounds, size - until_bounds);
+              }
+              // LIVE mode can temporarily run out of PCM. Never fall back to the
+              // physical microphone: return silence until the next live chunk arrives.
+              memset(buffer, 0, size);
+              return true;
+          }'''
+          if old not in s:
+              raise SystemExit('underflow block not found')
+          p.write_text(s.replace(old, new), encoding='utf-8')
+          PY
+
+      - name: Build armeabi-v7a native hook
+        shell: bash
+        run: |
+          NDK="$ANDROID_HOME/ndk/25.2.9519653"
+          CMAKE="$ANDROID_HOME/cmake/3.22.1/bin/cmake"
+          "$CMAKE" \
+            -S upstream/app/src/main/cpp \
+            -B native-build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_NDK="$NDK" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -GNinja
+          "$CMAKE" --build native-build --target xposedlab -j2
+          NEW_SO="$(find native-build -type f -name 'libxposedlab.so' | head -1)"
+          test -n "$NEW_SO"
+          mkdir -p replace/lib/armeabi-v7a
+          cp "$NEW_SO" replace/lib/armeabi-v7a/libxposedlab.so
+
+      - name: Replace native hook and re-sign APK
+        shell: bash
+        run: |
+          cp PhantomMic-Live-v2-base.apk PhantomMic-Live-v2-unsigned.apk
+          zip -d PhantomMic-Live-v2-unsigned.apk 'lib/armeabi-v7a/libxposedlab.so' >/dev/null || true
+          zip -d PhantomMic-Live-v2-unsigned.apk 'META-INF/*.RSA' 'META-INF/*.SF' 'META-INF/*.MF' >/dev/null || true
+          (cd replace && zip -0 -q -r ../PhantomMic-Live-v2-unsigned.apk lib/armeabi-v7a/libxposedlab.so)
+
+          BT="$ANDROID_HOME/build-tools/33.0.2"
+          "$BT/zipalign" -f -p 4 PhantomMic-Live-v2-unsigned.apk PhantomMic-Live-v2-aligned.apk
+
+          keytool -genkeypair -noprompt \
+            -keystore livev2.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -dname 'CN=Android Debug,O=Android,C=US' \
+            -keyalg RSA -keysize 2048 -validity 10000
+
+          "$BT/apksigner" sign \
+            --ks livev2.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out PhantomMic-Live-v2-signed.apk \
+            PhantomMic-Live-v2-aligned.apk
+
+          "$BT/apksigner" verify --verbose --print-certs PhantomMic-Live-v2-signed.apk
+
+      - name: Upload v2 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhantomMic-Live-v2-signed-apk
+          path: PhantomMic-Live-v2-signed.apk
+          if-no-files-found: error
