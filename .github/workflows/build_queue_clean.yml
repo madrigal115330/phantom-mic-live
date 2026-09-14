@@ -1,0 +1,58 @@
+name: Build PhantomMic Queue Clean
+
+on:
+  push:
+    paths:
+      - 'patches/phantommic_queue_clean.patch'
+      - '.github/workflows/build_queue_clean.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android components
+        run: |
+          sdkmanager 'platforms;android-33' 'build-tools;33.0.2' 'ndk;25.2.9519653' 'cmake;3.22.1'
+
+      - name: Clone exact clean PhantomMic source
+        run: |
+          git clone https://github.com/Mino260806/PhantomMic.git src
+          cd src
+          git checkout c8fd96ee8e9e164827649ef9ea35e4cf592f85ab
+
+      - name: Apply only queue-mode patch
+        run: |
+          cd src
+          git apply --check ../patches/phantommic_queue_clean.patch
+          git apply ../patches/phantommic_queue_clean.patch
+
+      - name: Build debug APK
+        run: |
+          cd src
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Verify APK exists
+        run: |
+          test -f src/app/build/outputs/apk/debug/app-debug.apk
+          ls -lh src/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhantomMic-Queue-v2.1-apk
+          path: src/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
