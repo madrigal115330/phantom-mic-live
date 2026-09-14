@@ -3,7 +3,7 @@ name: Build PhantomMic Queue Clean
 on:
   push:
     paths:
-      - 'patches/phantommic_queue_clean.patch'
+      - 'overlay/**'
       - '.github/workflows/build_queue_clean.yml'
   workflow_dispatch:
 
@@ -24,8 +24,7 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install Android components
-        run: |
-          sdkmanager 'platforms;android-33' 'build-tools;33.0.2' 'ndk;25.2.9519653' 'cmake;3.22.1'
+        run: sdkmanager 'platforms;android-33' 'build-tools;33.0.2' 'ndk;25.2.9519653' 'cmake;3.22.1'
 
       - name: Clone exact clean PhantomMic source
         run: |
@@ -33,11 +32,15 @@ jobs:
           cd src
           git checkout c8fd96ee8e9e164827649ef9ea35e4cf592f85ab
 
-      - name: Apply only queue-mode patch
+      - name: Overlay only queue-mode files
         run: |
-          cd src
-          git apply --check ../patches/phantommic_queue_clean.patch
-          git apply ../patches/phantommic_queue_clean.patch
+          cp -f overlay/app/build.gradle src/app/build.gradle
+          cp -f overlay/settings.gradle src/settings.gradle
+          cp -f overlay/app/src/main/cpp/main.cpp src/app/src/main/cpp/main.cpp
+          cp -f overlay/app/src/main/cpp/phantom/PhantomBridge.h src/app/src/main/cpp/phantom/PhantomBridge.h
+          cp -f overlay/app/src/main/cpp/phantom/PhantomBridge.cpp src/app/src/main/cpp/phantom/PhantomBridge.cpp
+          cp -f overlay/app/src/main/java/tn/amin/phantom_mic/PhantomManager.java src/app/src/main/java/tn/amin/phantom_mic/PhantomManager.java
+          cp -f overlay/app/src/main/java/tn/amin/phantom_mic/audio/AudioMaster.java src/app/src/main/java/tn/amin/phantom_mic/audio/AudioMaster.java
 
       - name: Build debug APK
         run: |
