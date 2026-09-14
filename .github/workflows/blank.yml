@@ -13,7 +13,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -45,123 +45,140 @@ jobs:
           from pathlib import Path
 
           root = Path('upstream')
+
+          # Xposed API 82 is not in Maven Central/JCenter anymore.
+          # Add the official Xposed Maven repository before Gradle resolves dependencies.
+          settings = root / 'settings.gradle'
+          gs = settings.read_text(encoding='utf-8')
+          if 'https://api.xposed.info/' not in gs:
+              gs = gs.replace('        jcenter();', "        jcenter();\n        maven { url 'https://api.xposed.info/' }")
+          settings.write_text(gs, encoding='utf-8')
+
           java_dir = root / 'app/src/main/java/tn/amin/phantom_mic'
           audio_dir = java_dir / 'audio'
 
           live_client = r'''package tn.amin.phantom_mic.audio;
 
-          import java.io.DataInputStream;
-          import java.io.EOFException;
-          import java.net.InetSocketAddress;
-          import java.net.Socket;
+import java.io.DataInputStream;
+import java.io.EOFException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 
-          import tn.amin.phantom_mic.log.Logger;
+import tn.amin.phantom_mic.log.Logger;
 
-          public class LivePcmClient {
-              private static final String HOST = "127.0.0.1";
-              private static final int PORT = 28661;
-              private static final int MAGIC = 0x42345043;
-              private static final int MAX_PACKET = 1024 * 1024;
+public class LivePcmClient {
+    private static final String HOST = "127.0.0.1";
+    private static final int PORT = 28661;
+    private static final int MAGIC = 0x42345043; // B4PC
+    private static final int MAX_PACKET = 1024 * 1024;
 
-              private final AudioMaster audioMaster;
-              private volatile boolean running;
-              private Thread worker;
-              private Socket socket;
+    private final AudioMaster audioMaster;
+    private volatile boolean running;
+    private Thread worker;
+    private Socket socket;
 
-              public LivePcmClient(AudioMaster audioMaster) {
-                  this.audioMaster = audioMaster;
-              }
+    public LivePcmClient(AudioMaster audioMaster) {
+        this.audioMaster = audioMaster;
+    }
 
-              public synchronized void start() {
-                  if (running) return;
-                  running = true;
-                  worker = new Thread(this::runLoop, "PhantomMic-LivePcm");
-                  worker.setDaemon(true);
-                  worker.start();
-              }
+    public synchronized void start() {
+        if (running) return;
+        running = true;
+        worker = new Thread(this::runLoop, "PhantomMic-LivePcm");
+        worker.setDaemon(true);
+        worker.start();
+    }
 
-              public synchronized void stop() {
-                  running = false;
-                  closeSocket();
-                  if (worker != null) {
-                      worker.interrupt();
-                      worker = null;
-                  }
-              }
+    public synchronized void stop() {
+        running = false;
+        closeSocket();
+        if (worker != null) {
+            worker.interrupt();
+            worker = null;
+        }
+    }
 
-              private void runLoop() {
-                  while (running) {
-                      DataInputStream in = null;
-                      try {
-                          Socket s = new Socket();
-                          s.setTcpNoDelay(true);
-                          s.connect(new InetSocketAddress(HOST, PORT), 700);
-                          socket = s;
-                          in = new DataInputStream(s.getInputStream());
-                          Logger.d("Live PCM connected to B4APawCall");
+    private void runLoop() {
+        while (running) {
+            DataInputStream in = null;
+            try {
+                Socket s = new Socket();
+                s.setTcpNoDelay(true);
+                s.connect(new InetSocketAddress(HOST, PORT), 700);
+                socket = s;
+                in = new DataInputStream(s.getInputStream());
+                Logger.d("Live PCM connected to B4APawCall");
 
-                          while (running) {
-                              int magic;
-                              try {
-                                  magic = in.readInt();
-                              } catch (EOFException eof) {
-                                  break;
-                              }
-                              if (magic != MAGIC) {
-                                  throw new IllegalStateException("Bad live PCM magic: " + Integer.toHexString(magic));
-                              }
-                              int sampleRate = in.readInt();
-                              int audioFormat = in.readInt();
-                              int channelCount = in.readInt();
-                              int length = in.readInt();
-                              if (length < 0 || length > MAX_PACKET) {
-                                  throw new IllegalStateException("Bad live PCM packet length: " + length);
-                              }
-                              if (length == 0) continue;
-                              byte[] pcm = new byte[length];
-                              in.readFully(pcm);
-                              audioMaster.pushPcm(sampleRate, audioFormat, channelCount, pcm);
-                          }
-                      } catch (Throwable t) {
-                          if (running) Logger.d("Live PCM waiting/reconnecting: " + t.getClass().getSimpleName() + ": " + t.getMessage());
-                      } finally {
-                          try { if (in != null) in.close(); } catch (Throwable ignored) {}
-                          closeSocket();
-                      }
-                      if (running) {
-                          try { Thread.sleep(180); } catch (InterruptedException ignored) {}
-                      }
-                  }
-                  Logger.d("Live PCM client stopped");
-              }
+                while (running) {
+                    int magic;
+                    try {
+                        magic = in.readInt();
+                    } catch (EOFException eof) {
+                        break;
+                    }
+                    if (magic != MAGIC) {
+                        throw new IllegalStateException("Bad live PCM magic: " + Integer.toHexString(magic));
+                    }
 
-              private synchronized void closeSocket() {
-                  if (socket != null) {
-                      try { socket.close(); } catch (Throwable ignored) {}
-                      socket = null;
-                  }
-              }
-          }
-          '''
+                    int sampleRate = in.readInt();
+                    int audioFormat = in.readInt();
+                    int channelCount = in.readInt();
+                    int length = in.readInt();
+                    if (length < 0 || length > MAX_PACKET) {
+                        throw new IllegalStateException("Bad live PCM packet length: " + length);
+                    }
+                    if (length == 0) continue;
+
+                    byte[] pcm = new byte[length];
+                    in.readFully(pcm);
+                    audioMaster.pushPcm(sampleRate, audioFormat, channelCount, pcm);
+                }
+            } catch (Throwable t) {
+                if (running) {
+                    Logger.d("Live PCM waiting/reconnecting: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                }
+            } finally {
+                try { if (in != null) in.close(); } catch (Throwable ignored) {}
+                closeSocket();
+            }
+
+            if (running) {
+                try { Thread.sleep(180); } catch (InterruptedException ignored) {}
+            }
+        }
+        Logger.d("Live PCM client stopped");
+    }
+
+    private synchronized void closeSocket() {
+        if (socket != null) {
+            try { socket.close(); } catch (Throwable ignored) {}
+            socket = null;
+        }
+    }
+}
+'''
           (audio_dir / 'LivePcmClient.java').write_text(live_client, encoding='utf-8')
 
           audio = audio_dir / 'AudioMaster.java'
           s = audio.read_text(encoding='utf-8')
           marker = '    public native void onBufferChunkLoaded(byte[] bufferChunk);'
           insert = r'''
-              public void pushPcm(int sampleRate, int audioFormat, int channelCount, byte[] pcmData) {
-                  if (pcmData == null || pcmData.length == 0) return;
-                  if (mOutFormat == null) {
-                      Logger.d("LIVE PCM dropped: output format not ready");
-                      return;
-                  }
-                  MediaFormat source = new MediaFormat();
-                  source.setInteger(MediaFormat.KEY_SAMPLE_RATE, sampleRate);
-                  source.setInteger(MediaFormat.KEY_CHANNEL_COUNT, Math.max(1, channelCount));
-                  processInBuffer(source, pcmData);
-              }
+    public void pushPcm(int sampleRate, int audioFormat, int channelCount, byte[] pcmData) {
+        if (pcmData == null || pcmData.length == 0) return;
+        if (mOutFormat == null) {
+            Logger.d("LIVE PCM dropped: output format not ready");
+            return;
+        }
+        if (audioFormat != android.media.AudioFormat.ENCODING_PCM_16BIT) {
+            Logger.d("LIVE PCM warning: source encoding " + audioFormat + " (expected PCM16)");
+        }
+        MediaFormat source = new MediaFormat();
+        source.setInteger(MediaFormat.KEY_SAMPLE_RATE, sampleRate);
+        source.setInteger(MediaFormat.KEY_CHANNEL_COUNT, Math.max(1, channelCount));
+        processInBuffer(source, pcmData);
+    }
 
-          '''
+'''
           if marker not in s:
               raise SystemExit('AudioMaster marker not found')
           s = s.replace(marker, insert + marker)
@@ -172,11 +189,13 @@ jobs:
           if 'import tn.amin.phantom_mic.audio.LivePcmClient;' not in s:
               s = s.replace('import tn.amin.phantom_mic.audio.AudioMaster;',
                             'import tn.amin.phantom_mic.audio.AudioMaster;\nimport tn.amin.phantom_mic.audio.LivePcmClient;')
+
           field_marker = '    private final AudioMaster mAudioMaster;'
           s = s.replace(field_marker, field_marker + '\n    private LivePcmClient mLivePcmClient;')
 
           old_load = '''    public void load() {\n        ensureHasUriPath();\n\n        String fileName = mFileManager.readLine(mUriPath, FILE_CONFIG);\n        if (fileName == null || fileName.trim().isEmpty()) {\n            Logger.d("No audio file specified");\n            return;\n        }\n\n        FileDescriptor fd = mFileManager.openAudioWithName(mUriPath, fileName.trim());\n\n        if (fd == null) {\n            Toast.makeText(mContext.get(), "Could not open file", Toast.LENGTH_SHORT).show();\n            return;\n        }\n\n        mAudioMaster.load(fd);\n\n        Logger.d("Audio file loaded");\n    }'''
-          new_load = '''    public void load() {\n        ensureHasUriPath();\n\n        String fileName = mFileManager.readLine(mUriPath, FILE_CONFIG);\n        if (fileName == null || fileName.trim().isEmpty()) {\n            Logger.d("No audio file specified");\n            return;\n        }\n\n        if ("LIVE".equalsIgnoreCase(fileName.trim())) {\n            if (mLivePcmClient != null) mLivePcmClient.stop();\n            mLivePcmClient = new LivePcmClient(mAudioMaster);\n            mLivePcmClient.start();\n            Logger.d("PhantomMic LIVE mode started");\n            return;\n        }\n\n        FileDescriptor fd = mFileManager.openAudioWithName(mUriPath, fileName.trim());\n        if (fd == null) {\n            Logger.d("Could not open audio file: " + fileName.trim());\n            return;\n        }\n        mAudioMaster.load(fd);\n        Logger.d("Audio file loaded");\n    }'''
+
+          new_load = '''    public void load() {\n        ensureHasUriPath();\n\n        String fileName = mFileManager.readLine(mUriPath, FILE_CONFIG);\n        if (fileName == null || fileName.trim().isEmpty()) {\n            Logger.d("No audio file specified");\n            return;\n        }\n\n        if ("LIVE".equalsIgnoreCase(fileName.trim())) {\n            if (mLivePcmClient != null) {\n                mLivePcmClient.stop();\n            }\n            mLivePcmClient = new LivePcmClient(mAudioMaster);\n            mLivePcmClient.start();\n            Logger.d("PhantomMic LIVE mode started");\n            return;\n        }\n\n        FileDescriptor fd = mFileManager.openAudioWithName(mUriPath, fileName.trim());\n\n        if (fd == null) {\n            Logger.d("Could not open audio file: " + fileName.trim());\n            return;\n        }\n\n        mAudioMaster.load(fd);\n\n        Logger.d("Audio file loaded");\n    }'''
           if old_load not in s:
               raise SystemExit('PhantomManager load() block not found')
           s = s.replace(old_load, new_load)
@@ -186,9 +205,11 @@ jobs:
           if old_unload not in s:
               raise SystemExit('PhantomManager unload() block not found')
           s = s.replace(old_unload, new_unload)
+
           old_toast = '            Toast.makeText(mContext.get(), "[E] Defaulting to " + mUriPath.getPath(), Toast.LENGTH_SHORT).show();'
           if old_toast in s:
               s = s.replace(old_toast, '            Logger.d("Defaulting to " + mUriPath.getPath());')
+
           manager.write_text(s, encoding='utf-8')
           PY
 
