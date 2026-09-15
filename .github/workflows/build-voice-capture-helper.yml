@@ -22,6 +22,7 @@ jobs:
           git clone https://github.com/madkongo/CallVault.git callvault
           cd callvault
           git checkout 06b706f7ead73138ee04575bfe8b59b597349ad3
+          git submodule update --init --recursive
           git apply ../voice-capture-helper.patch
 
       - name: Setup Java 17
