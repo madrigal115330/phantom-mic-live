@@ -414,8 +414,14 @@ static void hook_RecordTrack_stop(void* thisPtr) {
 
 extern "C" void init_hooks() {
 
-    char *flingerLib = "/system/lib64/libaudioflinger.so";
+    // SM-A107F is a 32-bit device; its AudioFlinger library is under /system/lib.
+    char *flingerLib = "/system/lib/libaudioflinger.so";
     uint64_t base = GetLibAddress(flingerLib);
+
+    if (base == 0) {
+        LOGE("Could not locate %s in audioserver maps; hooks not installed", flingerLib);
+        return;
+    }
 
     void* addr;
 
