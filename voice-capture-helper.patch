@@ -1,0 +1,572 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index a3a8bae..8210aa5 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -141,7 +141,7 @@ android {
+     ndkVersion = "27.2.12479018"
+ 
+     defaultConfig {
+-        applicationId = "com.baba.callvault"
++        applicationId = "com.sara.voicecapturehelper"
+         minSdk = 30
+         targetSdk = 36
+         versionCode = ciVersionCode.get()
+@@ -160,7 +160,7 @@ android {
+         // Default provider authority. Only an isolated instrumented build overrides it; every normal
+         // build resolves to exactly the string RecorderBinderProvider.AUTHORITY hardcodes, so release
+         // output is unchanged.
+-        manifestPlaceholders["recorderAuthority"] = "com.baba.callvault.recorder"
++        manifestPlaceholders["recorderAuthority"] = "com.sara.voicecapturehelper.recorder"
+ 
+         buildConfigField("String", "CI_BUILD_NUMBER", "\"${ciBuildNumber.get()}\"")
+ 
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index ab240a5..2ea53fa 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -69,6 +69,7 @@
+          Sui installs no app at all, so ShizukuBackend resolves it from the permission it declares. -->
+     <queries>
+         <package android:name="moe.shizuku.privileged.api" />
++        <package android:name="com.reiceve.voice" />
+     </queries>
+ 
+     <application
+diff --git a/app/src/main/aidl/com/baba/callvault/server/IRecorderService.aidl b/app/src/main/aidl/com/baba/callvault/server/IRecorderService.aidl
+index 9c45bbf..d1978d1 100644
+--- a/app/src/main/aidl/com/baba/callvault/server/IRecorderService.aidl
++++ b/app/src/main/aidl/com/baba/callvault/server/IRecorderService.aidl
+@@ -280,4 +280,14 @@ interface IRecorderService {
+      * already happened, in a report from someone who was not debugging at the time.
+      */
+     String captureDiagnostics();
++
++    /**
++     * Streams raw far-party VoIP audio into outFd until stopFarPartyPcm(), the reader closes its end,
++     * or capture fails. Format: PCM16 little-endian, mono, 48000 Hz, no container/header.
++     * Appended to preserve all existing Binder transaction numbers.
++     */
++    boolean startFarPartyPcm(in ParcelFileDescriptor outFd);
++
++    /** Stops an active raw far-party PCM stream. Idempotent. */
++    void stopFarPartyPcm();
+ }
+diff --git a/app/src/main/java/com/baba/callvault/CallVaultApplication.kt b/app/src/main/java/com/baba/callvault/CallVaultApplication.kt
+index 06fb950..58ca9c7 100644
+--- a/app/src/main/java/com/baba/callvault/CallVaultApplication.kt
++++ b/app/src/main/java/com/baba/callvault/CallVaultApplication.kt
+@@ -84,12 +84,12 @@ class CallVaultApplication : Application() {
+             // A fresh host collects nothing until it is told to. Do this first and cheaply, so a daemon
+             // that relaunched mid-session is logging again before anything else happens to it.
+             RecorderBackend.syncDiagnostics(applicationContext)
+-            if (AppPreferences(applicationContext).isVoipRecordingEnabled()) {
+-                Thread {
+-                    runCatching { VoipCaptureController.sync(applicationContext) }
+-                        .onFailure { AppLogger.w(TAG, "VoIP re-arm failed: ${it.message}") }
+-                }.apply { isDaemon = true; name = "cv-voip-rearm" }.start()
+-            }
++            // Keep the far-party policy armed. No AudioRecord opens until the approved receiver app
++            // opens the provider stream, so this is idle-cost free.
++            Thread {
++                runCatching { RecorderConnection.service?.armVoipCapture() }
++                    .onFailure { AppLogger.w(TAG, "VoIP re-arm failed: ${it.message}") }
++            }.apply { isDaemon = true; name = "cv-voip-rearm" }.start()
+         }
+ 
+         // Push the diagnostics switch once at start as well as on every fresh binder.
+@@ -205,4 +205,4 @@ class CallVaultApplication : Application() {
+             }.apply { isDaemon = true }.start()
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/main/java/com/baba/callvault/server/RecorderBinderProvider.kt b/app/src/main/java/com/baba/callvault/server/RecorderBinderProvider.kt
+index ae97f26..4825896 100644
+--- a/app/src/main/java/com/baba/callvault/server/RecorderBinderProvider.kt
++++ b/app/src/main/java/com/baba/callvault/server/RecorderBinderProvider.kt
+@@ -16,6 +16,8 @@ import android.os.Binder
+ import android.os.Bundle
+ import android.os.IBinder
+ import android.os.Process
++import android.os.ParcelFileDescriptor
++import java.io.FileNotFoundException
+ import com.baba.callvault.services.recording.handoff.HandoffReceiver
+ import com.baba.callvault.services.recording.handoff.TrackAProbe
+ import com.baba.callvault.utils.AppLogger
+@@ -137,6 +139,41 @@ class RecorderBinderProvider : ContentProvider() {
+ 
+     override fun getType(uri: Uri): String? = null
+ 
++    /**
++     * Private app-to-app PCM bridge. Only com.reiceve.voice may open this URI:
++     * content://com.sara.voicecapturehelper.recorder/far-party-pcm
++     */
++    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
++        if (uri.pathSegments.singleOrNull() != PCM_PATH || mode != "r") {
++            throw FileNotFoundException("Unknown stream")
++        }
++        val callerUid = Binder.getCallingUid()
++        val callerPackages = context?.packageManager?.getPackagesForUid(callerUid).orEmpty()
++        if (callerPackages.none { pkg -> pkg == ALLOWED_RECEIVER_PACKAGE }) {
++            AppLogger.w(TAG, "PCM stream rejected for uid=$callerUid")
++            throw SecurityException("Caller is not allowed to receive call audio")
++        }
++
++        val service = RecorderConnection.service
++            ?: throw FileNotFoundException("Recorder daemon is not connected; finish Wireless Debugging setup first")
++
++        if (!runCatching { service.armVoipCapture() }.getOrDefault(false)) {
++            throw FileNotFoundException("VoIP audio policy is unavailable")
++        }
++
++        val pipe = ParcelFileDescriptor.createReliablePipe()
++        val accepted = try {
++            service.startFarPartyPcm(pipe[1])
++        } finally {
++            runCatching { pipe[1].close() }
++        }
++        if (!accepted) {
++            runCatching { pipe[0].close() }
++            throw FileNotFoundException("Far-party capture could not start")
++        }
++        return pipe[0]
++    }
++
+     override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+ 
+     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+@@ -152,7 +189,10 @@ class RecorderBinderProvider : ContentProvider() {
+         private const val TAG = "CV:RecorderConn"
+ 
+         /** Provider authority registered in the manifest; the daemon resolves "<authority>". */
+-        const val AUTHORITY = "com.baba.callvault.recorder"
++        const val AUTHORITY = "com.sara.voicecapturehelper.recorder"
++
++        const val PCM_PATH = "far-party-pcm"
++        const val ALLOWED_RECEIVER_PACKAGE = "com.reiceve.voice"
+ 
+         /** Mirrors ShizukuProvider.METHOD_SEND_BINDER. */
+         const val METHOD_SEND_BINDER = "sendBinder"
+diff --git a/app/src/main/java/com/baba/callvault/server/RecorderServiceImpl.kt b/app/src/main/java/com/baba/callvault/server/RecorderServiceImpl.kt
+index aa2ae15..c62f944 100644
+--- a/app/src/main/java/com/baba/callvault/server/RecorderServiceImpl.kt
++++ b/app/src/main/java/com/baba/callvault/server/RecorderServiceImpl.kt
+@@ -282,6 +282,47 @@ open class RecorderServiceImpl(private val apkPath: String) : IRecorderService.S
+         return true
+     }
+ 
++    override fun startFarPartyPcm(outFd: ParcelFileDescriptor?): Boolean {
++        if (outFd == null) return false
++        if (!VoipAudioPolicy.isArmed) {
++            AppLogger.e(TAG, "startFarPartyPcm refused: policy was not armed before the call")
++            runCatching { outFd.close() }
++            return false
++        }
++        if (!recordingActive.compareAndSet(false, true)) {
++            AppLogger.w(TAG, "startFarPartyPcm refused: another capture is active")
++            runCatching { outFd.close() }
++            return false
++        }
++
++        val done = CountDownLatch(1)
++        var started = false
++        workerHandler.post {
++            val pcmSession = FarPartyPcmSession(outFd) { ended ->
++                workerHandler.post {
++                    if (session === ended) session = null
++                    recordingActive.set(false)
++                }
++            }
++            started = runCatching {
++                pcmSession.start()
++                session = pcmSession
++                true
++            }.onFailure {
++                AppLogger.e(TAG, "startFarPartyPcm failed: ${it.message}", it)
++                runCatching { pcmSession.stop() }
++                recordingActive.set(false)
++            }.getOrDefault(false)
++            done.countDown()
++        }
++        runCatching { done.await(START_PCM_AWAIT_MS, TimeUnit.MILLISECONDS) }
++        return started
++    }
++
++    override fun stopFarPartyPcm() {
++        stopRecording()
++    }
++
+     // Releases the daemon's held handoff AudioRecord (the app owns capture after the handoff; this
+     // just frees the daemon's now-unneeded input so the next call can create a fresh one).
+     override fun startHandoffHeld(source: String?, sampleRate: Int, channels: Int): Boolean {
+@@ -480,6 +521,9 @@ open class RecorderServiceImpl(private val apkPath: String) : IRecorderService.S
+         /** Upper bound the synchronous stopRecording() waits for session teardown (muxer trailer). */
+         private const val STOP_AWAIT_MS = 6000L
+ 
++        /** Upper bound for opening the raw PCM sink and pipe. */
++        private const val START_PCM_AWAIT_MS = 3000L
++
+         /**
+          * The transaction Shizuku's server sends to shut a user service down.
+          *
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 7b1d6a7..6136aeb 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -10,7 +10,7 @@
+     <!-- ========================================== -->
+     <!-- GENERAL MESSAGES & APP LEVEL               -->
+     <!-- ========================================== -->
+-    <string name="app_name" translatable="false">CallVault</string>
++    <string name="app_name" translatable="false">Voice Capture Helper</string>
+     <string name="general_close">Close</string>
+     <string name="voicemail_contact_label">Voicemail</string>
+     <string name="general_recommended">Recommended</string>
+diff --git a/app/src/test/java/com/baba/callvault/server/RecorderTransactionCodesTest.kt b/app/src/test/java/com/baba/callvault/server/RecorderTransactionCodesTest.kt
+index 18a6660..19d288e 100644
+--- a/app/src/test/java/com/baba/callvault/server/RecorderTransactionCodesTest.kt
++++ b/app/src/test/java/com/baba/callvault/server/RecorderTransactionCodesTest.kt
+@@ -55,6 +55,8 @@ class RecorderTransactionCodesTest {
+         assertEquals(first + 22, IRecorderService.Stub.TRANSACTION_diagnosticDump)
+         // Appended for issue #28b's overrun counter.
+         assertEquals(first + 23, IRecorderService.Stub.TRANSACTION_captureDiagnostics)
++        assertEquals(first + 24, IRecorderService.Stub.TRANSACTION_startFarPartyPcm)
++        assertEquals(first + 25, IRecorderService.Stub.TRANSACTION_stopFarPartyPcm)
+     }
+ 
+     @Test
+diff --git a/B4A_RECEIVER.md b/B4A_RECEIVER.md
+new file mode 100644
+index 0000000..723a9e9
+--- /dev/null
++++ b/B4A_RECEIVER.md
+@@ -0,0 +1,75 @@
++# B4A receiver (com.reiceve.voice)
++
++The helper exposes this read-only stream:
++
++    content://com.sara.voicecapturehelper.recorder/far-party-pcm
++
++Only the installed package named com.reiceve.voice is accepted. The stream is raw PCM16
++little-endian, mono, 48,000 Hz. It has no WAV header. Reads may return any byte count, so enqueue
++exactly Length bytes from each event; do not assume Android preserves the helper's 1,920-byte writes.
++
++Add the JavaObject and RandomAccessFile libraries, then use:
++
++Add this provider visibility entry to the B4A manifest:
++
++~~~basic
++AddManifestText(
++<queries>
++    <provider android:authorities="com.sara.voicecapturehelper.recorder" />
++</queries>
++)
++~~~
++
++~~~basic
++Sub Process_Globals
++    Private PcmAStream As AsyncStreams
++    Private PcmPfd As JavaObject
++End Sub
++
++Sub StartFarPartyPcm
++    Dim ctxt As JavaObject
++    ctxt.InitializeContext
++    Dim resolver As JavaObject = ctxt.RunMethod("getContentResolver", Null)
++
++    Dim uriClass As JavaObject
++    uriClass.InitializeStatic("android.net.Uri")
++    Dim uri As Object = uriClass.RunMethod("parse", Array( _
++        "content://com.sara.voicecapturehelper.recorder/far-party-pcm"))
++
++    PcmPfd = resolver.RunMethod("openFileDescriptor", Array(uri, "r"))
++    Dim fd As Object = PcmPfd.RunMethod("getFileDescriptor", Null)
++
++    Dim input As JavaObject
++    input.InitializeNewInstance("java.io.FileInputStream", Array(fd))
++    PcmAStream.Initialize(input, Null, "Pcm")
++End Sub
++
++Sub Pcm_NewData(Buffer() As Byte)
++    ' Buffer contains raw far-party PCM. Copy/enqueue it immediately for VAD/STT.
++    ' SttQueue.Add(Buffer)
++End Sub
++
++Sub Pcm_Error
++    Log("PCM stream error")
++    StopFarPartyPcm
++End Sub
++
++Sub Pcm_Terminated
++    Log("PCM stream closed")
++    StopFarPartyPcm
++End Sub
++
++Sub StopFarPartyPcm
++    If PcmAStream.IsInitialized Then PcmAStream.Close
++    If PcmPfd.IsInitialized Then PcmPfd.RunMethod("close", Null)
++End Sub
++~~~
++
++Call StartFarPartyPcm only after the WhatsApp call is answered. Closing PcmPfd makes the helper's
++pipe fail and the privileged capture session cleans itself up.
++
++The helper must have completed its Wireless Debugging pairing and its persistent daemon must be
++running before the call starts. The helper arms the VoIP playback policy every time that daemon
++connects.
++
++No storage permission is used by either side.
+diff --git a/VOICE_CAPTURE_CHANGES.md b/VOICE_CAPTURE_CHANGES.md
+new file mode 100644
+index 0000000..ccc1752
+--- /dev/null
++++ b/VOICE_CAPTURE_CHANGES.md
+@@ -0,0 +1,27 @@
++# Voice Capture Helper changes
++
++This fork keeps CallVault's proven no-root Embedded ADB / Wireless Debugging setup and persistent
++shell-UID recorder daemon, and adds a private raw-audio bridge for one receiver application.
++
++## Contract
++
++- Helper application ID: com.sara.voicecapturehelper
++- Allowed receiver application ID: com.reiceve.voice
++- Provider URI: content://com.sara.voicecapturehelper.recorder/far-party-pcm
++- Mode: read-only
++- Stream: headerless PCM16LE, mono, 48,000 Hz
++- Capture: far party only; no microphone and no near/far downmix
++- Storage permissions: none
++
++The receiver opens the URI after a WhatsApp call is answered and closes it when the call ends. A
++reliable ParcelFileDescriptor pipe transports audio directly from the privileged daemon, through the
++helper provider, to the receiver. Closing the reader produces a broken pipe in the daemon and releases
++the AudioRecord.
++
++Every newly connected daemon arms VoipAudioPolicy immediately. This must happen before WhatsApp
++creates its USAGE_VOICE_COMMUNICATION playback track.
++
++## Upstream and license
++
++Based on madkongo/CallVault. The upstream GPL-3.0-or-later license and its additional terms remain in
++LICENSE. Source recipients must retain and comply with them.
+diff --git a/app/src/main/java/com/baba/callvault/server/FarPartyPcmSession.kt b/app/src/main/java/com/baba/callvault/server/FarPartyPcmSession.kt
+new file mode 100644
+index 0000000..096d2cf
+--- /dev/null
++++ b/app/src/main/java/com/baba/callvault/server/FarPartyPcmSession.kt
+@@ -0,0 +1,95 @@
++/*
++ * Voice Capture Helper: far-party PCM bridge derived from CallVault.
++ * GPL-3.0-or-later; see LICENSE at the project root.
++ */
++package com.baba.callvault.server
++
++import android.media.AudioRecord
++import android.os.ParcelFileDescriptor
++import android.os.Process
++import com.baba.callvault.utils.AppLogger
++import java.io.FileOutputStream
++import java.util.concurrent.atomic.AtomicBoolean
++
++/** Streams only the remote VoIP party as raw PCM16 mono 48 kHz into a pipe. */
++internal class FarPartyPcmSession(
++    private val outFd: ParcelFileDescriptor,
++    private val onEnded: (FarPartyPcmSession) -> Unit,
++) : RecordingSession {
++    private val stopRequested = AtomicBoolean(false)
++    @Volatile private var record: AudioRecord? = null
++    @Volatile private var output: FileOutputStream? = null
++    @Volatile private var thread: Thread? = null
++
++    override fun start() {
++        check(VoipAudioPolicy.isArmed) { "VoIP policy must be armed before the call" }
++        val sink = VoipAudioPolicy.createSink()
++            ?: error("Could not create far-party AudioRecord sink")
++        val stream = FileOutputStream(outFd.fileDescriptor)
++        record = sink
++        output = stream
++
++        try {
++            sink.startRecording()
++            check(sink.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
++                "Far-party AudioRecord did not enter RECORDING state"
++            }
++            thread = Thread({ pump(sink, stream) }, "far-party-pcm-pipe").apply {
++                isDaemon = true
++                start()
++            }
++            AppLogger.i(TAG, "Far-party PCM stream started: 48000 Hz, mono, PCM16LE")
++        } catch (t: Throwable) {
++            closeResources()
++            throw t
++        }
++    }
++
++    private fun pump(sink: AudioRecord, stream: FileOutputStream) {
++        runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO) }
++        val pcm = ByteArray(CHUNK_BYTES)
++        try {
++            while (!stopRequested.get()) {
++                var offset = 0
++                while (offset < pcm.size && !stopRequested.get()) {
++                    val read = sink.read(pcm, offset, pcm.size - offset, AudioRecord.READ_BLOCKING)
++                    if (read < 0) error("AudioRecord.read failed: $read")
++                    if (read > 0) offset += read
++                }
++                if (offset > 0) stream.write(pcm, 0, offset)
++            }
++        } catch (t: Throwable) {
++            if (!stopRequested.get()) {
++                AppLogger.i(TAG, "PCM consumer disconnected or stream ended: ${t.message}")
++            }
++        } finally {
++            stopRequested.set(true)
++            closeResources()
++            onEnded(this)
++        }
++    }
++
++    override fun stop() {
++        if (!stopRequested.compareAndSet(false, true)) return
++        runCatching { record?.stop() }
++        if (Thread.currentThread() !== thread) runCatching { thread?.join(STOP_JOIN_MS) }
++        closeResources()
++    }
++
++    @Synchronized
++    private fun closeResources() {
++        runCatching { record?.stop() }
++        runCatching { record?.release() }
++        runCatching { output?.close() }
++        runCatching { outFd.close() }
++        record = null
++        output = null
++    }
++
++    companion object {
++        private const val TAG = "CV:FarPcm"
++        private const val CHUNK_FRAMES = 960 // 20 ms at 48 kHz
++        private const val CHUNK_BYTES = CHUNK_FRAMES * 2
++        private const val STOP_JOIN_MS = 1_000L
++    }
++}
+diff --git a/b4a/FarPartyPcmReceiver.bas b/b4a/FarPartyPcmReceiver.bas
+new file mode 100644
+index 0000000..e02112a
+--- /dev/null
++++ b/b4a/FarPartyPcmReceiver.bas
+@@ -0,0 +1,68 @@
++'Class module: FarPartyPcmReceiver
++'Requires the JavaObject and RandomAccessFile libraries.
++Sub Class_Globals
++    Private mCallBack As Object
++    Private mEventName As String
++    Private PcmAStream As AsyncStreams
++    Private PcmPfd As JavaObject
++End Sub
++
++Public Sub Initialize(CallBack As Object, EventName As String)
++    mCallBack = CallBack
++    mEventName = EventName
++End Sub
++
++'Call only after the WhatsApp call is answered.
++Public Sub Start
++    If PcmAStream.IsInitialized Then Return
++
++    Dim ctxt As JavaObject
++    ctxt.InitializeContext
++    Dim resolver As JavaObject = ctxt.RunMethod("getContentResolver", Null)
++
++    Dim uriClass As JavaObject
++    uriClass.InitializeStatic("android.net.Uri")
++    Dim uri As Object = uriClass.RunMethod("parse", Array( _
++        "content://com.sara.voicecapturehelper.recorder/far-party-pcm"))
++
++    PcmPfd = resolver.RunMethod("openFileDescriptor", Array(uri, "r"))
++    Dim fd As Object = PcmPfd.RunMethod("getFileDescriptor", Null)
++    Dim input As JavaObject
++    input.InitializeNewInstance("java.io.FileInputStream", Array(fd))
++    PcmAStream.Initialize(input, Null, "Pcm")
++End Sub
++
++Private Sub Pcm_NewData(Buffer() As Byte)
++    'AsyncStreams owns/reuses its input handling; hand the event a private copy.
++    Dim Copy(Buffer.Length) As Byte
++    Bit.ArrayCopy(Buffer, 0, Copy, 0, Buffer.Length)
++    CallSubDelayed2(mCallBack, mEventName & "_Pcm", Copy)
++End Sub
++
++Private Sub Pcm_Error
++    Stop
++    CallSubDelayed2(mCallBack, mEventName & "_Error", LastException.Message)
++End Sub
++
++Private Sub Pcm_Terminated
++    Stop
++    CallSubDelayed(mCallBack, mEventName & "_Closed")
++End Sub
++
++Public Sub Stop
++    If PcmAStream.IsInitialized Then PcmAStream.Close
++    If PcmPfd.IsInitialized Then PcmPfd.RunMethod("close", Null)
++End Sub
++
++'Stream format constants.
++Public Sub SampleRate As Int
++    Return 48000
++End Sub
++
++Public Sub Channels As Int
++    Return 1
++End Sub
++
++Public Sub BitsPerSample As Int
++    Return 16
++End Sub
+diff --git a/b4a/ManifestSnippet.txt b/b4a/ManifestSnippet.txt
+new file mode 100644
+index 0000000..222d4fc
+--- /dev/null
++++ b/b4a/ManifestSnippet.txt
+@@ -0,0 +1,5 @@
++AddManifestText(
++<queries>
++    <provider android:authorities="com.sara.voicecapturehelper.recorder" />
++</queries>
++)
+diff --git a/b4a/README.txt b/b4a/README.txt
+new file mode 100644
+index 0000000..3f3d047
+--- /dev/null
++++ b/b4a/README.txt
+@@ -0,0 +1,28 @@
++B4A receiver package name must be:
++com.reiceve.voice
++
++Required libraries:
++- JavaObject
++- RandomAccessFile (for AsyncStreams)
++
++1. Add ManifestSnippet.txt content to the B4A manifest editor.
++2. Add FarPartyPcmReceiver.bas as a class module.
++3. Declare and initialize it:
++
++Private FarVoice As FarPartyPcmReceiver
++FarVoice.Initialize(Me, "FarVoice")
++
++4. After the WhatsApp call is answered:
++FarVoice.Start
++
++5. Receive arbitrary-size PCM chunks:
++
++Sub FarVoice_Pcm(Buffer() As Byte)
++    'Feed Buffer to your VAD / streaming STT queue.
++End Sub
++
++6. At call end:
++FarVoice.Stop
++
++Audio format: raw PCM16 little-endian, mono, 48000 Hz, no WAV header.
++No storage permission is required.
