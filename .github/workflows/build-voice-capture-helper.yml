@@ -1,0 +1,56 @@
+name: Build Voice Capture Helper
+
+on:
+  push:
+    branches:
+      - voice-capture-helper-build
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout build branch
+        uses: actions/checkout@v6
+
+      - name: Checkout pinned CallVault source
+        run: |
+          git clone https://github.com/madkongo/CallVault.git callvault
+          cd callvault
+          git checkout 06b706f7ead73138ee04575bfe8b59b597349ad3
+          git apply ../voice-capture-helper.patch
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          validate-wrappers: true
+          cache-provider: basic
+
+      - name: Build debug APK
+        working-directory: callvault
+        run: ./gradlew :app:assembleDebug -PversionName=1.0.0 -PversionCode=$GITHUB_RUN_NUMBER -PciBuildNumber=$GITHUB_RUN_ID --no-daemon --stacktrace
+
+      - name: Package deliverables
+        run: |
+          mkdir -p deliverables
+          cp callvault/app/build/outputs/apk/debug/app-debug.apk deliverables/VoiceCaptureHelper-debug.apk
+          (cd callvault && zip -qr ../deliverables/VoiceCaptureHelper-source.zip . -x ".git/*" "app/build/*" ".gradle/*")
+          (cd callvault && zip -qr ../deliverables/B4A-receiver-source.zip b4a B4A_RECEIVER.md)
+
+      - name: Upload APK and source
+        uses: actions/upload-artifact@v6
+        with:
+          name: voice-capture-helper
+          path: deliverables/*
+          retention-days: 30
+          if-no-files-found: error
