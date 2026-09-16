@@ -1,0 +1,3 @@
+GlassMic source: https://github.com/Xposed-Modules-Repo/io.mo.glassmic
+Commit: d21072be75563fd27fff4dc12eedfc7b0c073c92
+Native sources unchanged. New standalone test launcher replaces the LSPosed Java entrypoint.
