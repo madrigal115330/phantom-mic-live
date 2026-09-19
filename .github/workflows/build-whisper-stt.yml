@@ -46,7 +46,7 @@ jobs:
           gradle-version: '8.9'
 
       - name: Install Android native tools
-        run: sdkmanager 'ndk;27.0.12077973' 'cmake;3.22.1'
+        run: "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;27.0.12077973' 'cmake;3.22.1'
 
       - name: Build release AAR
         run: gradle --no-daemon :whisperstt:assembleRelease
