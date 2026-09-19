@@ -1,3 +1,4 @@
+# Builds the STT replacement only; it never accesses Android's microphone.
 name: Build WhisperStt for B4A
 
 on:
