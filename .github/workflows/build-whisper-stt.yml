@@ -25,17 +25,17 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout project
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout pinned whisper.cpp
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ggml-org/whisper.cpp
           ref: 5670d5c0bbcb148feabef84400a07cfca9aa3b30
           path: third_party/whisper.cpp
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
